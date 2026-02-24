@@ -23,7 +23,8 @@ class DecisionFlowService:
         Phase 1-2: Extract text and run compatibility analysis.
         Returns compatibility report without transformation.
         """
-        text = rule_extraction_factory.extract_text(file_content, filename)
+        # Use text-only for decision flow to conserve prompt tokens
+        text = rule_extraction_factory.extract_text(file_content, filename, with_images=False)
         if not text:
             return {"error": "Could not extract text from document"}
 
@@ -74,12 +75,10 @@ class DecisionFlowService:
                 {
                     "rule_path": r.get("rule_path", ""),
                     "description": r.get("description", ""),
-                    "message": "Applied with caution — review required"
+                    "message": "Flagged but not applied — review required"
                 }
                 for r in conditional_rules
             ]
-            # Include conditional rules in approved but mark them
-            approved = approved + conditional_rules
         else:
             # LOW — report only, no transformation
             action = "report_only"

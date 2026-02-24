@@ -62,27 +62,18 @@ class GenericExtractor(BaseExtractor):
 class AIExtractor(BaseExtractor):
     async def extract_rules(self, file_content: bytes, filename: str) -> Dict[str, Any]:
         from backend.app.services.ai_service import ai_service
-        # 1. Get plain text first
-        text = ""
-        ext = filename.lower().split('.')[-1]
-        if ext == 'pdf':
-             reader = PdfReader(io.BytesIO(file_content))
-             text = "\n".join([page.extract_text() for page in reader.pages])
-        else:
-             # Basic generic text extraction or use ODF if applicable
-             text = str(file_content[:5000]) # Fallback
-
+        # 1. Get plain text first (no images for rule extraction)
+        text = rule_extraction_factory.extract_text(file_content, filename, with_images=False)
+        
         if ai_service.is_available():
+            # Standard extraction often needs more context if the document is huge, 
+            # but ai_service handles the truncation.
             return await ai_service.extract_standard(text, filename)
         return {"error": "AI Service unavailable"}
 
 class RuleExtractionFactory:
     @staticmethod
     def get_extractor(filename: str) -> BaseExtractor:
-        # For now, let's keep it deterministic unless specifically needed?
-        # Actually, for the new flow, we want AI to be high priority if available.
-        # However, to avoid breaking current code that might expect sync calls:
-        # I'll create an async-aware factory method or just use AI as an option.
         ext = filename.lower().split('.')[-1] if '.' in filename else ""
         
         if ext in ['odt', 'ott', 'odm']:
@@ -104,8 +95,8 @@ class RuleExtractionFactory:
         return extractor.extract_rules(file_content, filename)
 
     @staticmethod
-    def extract_text(file_content: bytes, filename: str) -> str:
-        """Extracts plain text with embedded images (as base64) from file content."""
+    def extract_text(file_content: bytes, filename: str, with_images: bool = False) -> str:
+        """Extracts plain text. Optionally includes embedded images as base64."""
         import io
         import base64
         
@@ -114,37 +105,40 @@ class RuleExtractionFactory:
         
         try:
             if ext == 'pdf':
-                 import fitz
-                 doc = fitz.open(stream=file_content, filetype="pdf")
-                 pages_text = []
-                 for page_index in range(len(doc)):
-                     page = doc[page_index]
-                     p_text = page.get_text()
-                     
-                     # Extract images for this page
-                     image_list = page.get_images(full=True)
-                     for img_index, img in enumerate(image_list):
-                         xref = img[0]
-                         base_image = doc.extract_image(xref)
-                         image_bytes = base_image["image"]
-                         image_ext = base_image["ext"]
-                         # Data URIs can be huge, let's only take small/medium ones to avoid token bloat
-                         # Technical diagrams are often < 50kb
-                         if len(image_bytes) < 500000: # 500KB limit per image for AI context
-                             b64 = base64.b64encode(image_bytes).decode("utf-8")
-                             data_uri = f"data:image/{image_ext};base64,{b64}"
-                             p_text += f"\n\n![Original Image {page_index+1}-{img_index+1}]({data_uri})\n\n"
-                         else:
-                             p_text += f"\n\n![Large Image Placeholder: {image_ext}]\n\n"
-                     
-                     pages_text.append(p_text)
-                 text = "\n---\n".join(pages_text)
+                try:
+                    import fitz
+                    doc = fitz.open(stream=file_content, filetype="pdf")
+                    pages_text = []
+                    for page_index in range(len(doc)):
+                        page = doc[page_index]
+                        p_text = page.get_text()
+                        
+                        if with_images:
+                            # Extract images only if requested (for detailed preview, not for LLM)
+                            image_list = page.get_images(full=True)
+                            for img_index, img in enumerate(image_list):
+                                xref = img[0]
+                                base_image = doc.extract_image(xref)
+                                image_bytes = base_image["image"]
+                                image_ext = base_image["ext"]
+                                if len(image_bytes) < 500000:
+                                    b64 = base64.b64encode(image_bytes).decode("utf-8")
+                                    data_uri = f"data:image/{image_ext};base64,{b64}"
+                                    p_text += f"\n\n![Original Image {page_index+1}-{img_index+1}]({data_uri})\n\n"
+                                else:
+                                    p_text += f"\n\n![Large Image Placeholder: {image_ext}]\n\n"
+                        pages_text.append(p_text)
+                    text = "\n---\n".join(pages_text)
+                except ImportError:
+                    # Fallback to pypdf if fitz is missing
+                    from pypdf import PdfReader
+                    reader = PdfReader(io.BytesIO(file_content))
+                    text = "\n".join([page.extract_text() for page in reader.pages])
                  
             elif ext in ['docx', 'doc']:
                  try:
                      import mammoth
                      import markdownify
-                     # mammoth handles image conversion to base64 by default in its HTML output
                      result = mammoth.convert_to_html(io.BytesIO(file_content))
                      html = result.value
                      text = markdownify.markdownify(html)
@@ -153,7 +147,6 @@ class RuleExtractionFactory:
             elif ext in ['txt', 'md', 'json', 'xml', 'html', 'css', 'js', 'py', 'java', 'c', 'cpp']:
                  text = file_content.decode('utf-8', errors='ignore')
             else:
-                 # Fallback for binary or unknown
                  text = file_content.decode('utf-8', errors='ignore')
                  
             return text

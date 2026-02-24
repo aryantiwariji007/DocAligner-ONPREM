@@ -11,6 +11,7 @@ from backend.app.services.storage import minio_client
 from backend.app.services.audit_service import audit_service
 import uuid
 import json
+from backend.app.services.memory_service import memory_service
 
 router = APIRouter()
 
@@ -119,7 +120,13 @@ async def promote_document_to_standard(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to extract rules: {str(e)}")
         
-    # 5. Determine new version number (simplified: count existing + 1)
+    # 5. Store rules in Long-Term Memory (ContextMemory)
+    try:
+        memory_service.add_standard_rules(str(standard_id), rules)
+    except Exception as e:
+        print(f"Warning: Failed to add standard rules to context memory: {e}")
+        
+    # 6. Determine new version number (simplified: count existing + 1)
     stmt = select(StandardVersion).where(StandardVersion.standard_id == standard_id)
     result = await db.execute(stmt)
     versions = result.scalars().all()
@@ -227,3 +234,57 @@ async def read_standard_versions(
     result = await db.execute(stmt)
     versions = result.scalars().all()
     return versions
+
+@router.delete("/{standard_id}")
+async def delete_standard(
+    *,
+    db: AsyncSession = Depends(get_session),
+    standard_id: uuid.UUID,
+    current_user: dict = Depends(deps.get_current_active_user),
+) -> Any:
+    """
+    Delete a standard and all its versions and assignments.
+    """
+    standard = await db.get(Standard, standard_id)
+    if not standard:
+        raise HTTPException(status_code=404, detail="Standard not found")
+
+    # Manual cleanup to avoid FK constraints if CASCADE isn't enough
+    from sqlalchemy import delete
+    from backend.app.models.standard import StandardVersion, StandardAssignment
+    from backend.app.models.validation_audit import ValidationResult
+
+    # 1. Get all versions for this standard
+    stmt = select(StandardVersion).where(StandardVersion.standard_id == standard_id)
+    result = await db.execute(stmt)
+    versions = result.scalars().all()
+    version_ids = [v.id for v in versions]
+
+    if version_ids:
+        # 2. Delete ValidationResults associated with these versions
+        await db.execute(delete(ValidationResult).where(ValidationResult.standard_version_id.in_(version_ids)))
+        
+        # 3. Delete StandardAssignments associated with these versions
+        await db.execute(delete(StandardAssignment).where(StandardAssignment.standard_version_id.in_(version_ids)))
+        
+        # 4. Delete StandardVersions
+        for v in versions:
+            await db.delete(v)
+
+    # 5. Finally delete the standard itself
+    await db.delete(standard)
+    
+    # Audit
+    try:
+        await audit_service.log_action(
+            db,
+            actor_id=current_user.get("sub", "unknown"),
+            action="DELETE_STANDARD",
+            target_id=standard_id,
+            details={"name": standard.name}
+        )
+    except Exception as e:
+        print(f"Audit log failed: {e}")
+
+    await db.commit()
+    return {"status": "ok", "message": "Standard deleted"}

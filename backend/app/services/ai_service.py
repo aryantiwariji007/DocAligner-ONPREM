@@ -1,594 +1,353 @@
 from typing import Dict, Any, List, Optional
-import os
-from google import genai
-from google.genai import types
+import json
+import httpx
 from backend.app.core.config import settings
+from backend.app.services.memory_service import memory_service
+
 
 class AIService:
     def __init__(self):
-        self.api_key = settings.GEMINI_API_KEY
-        if self.api_key:
-            self.client = genai.Client(api_key=self.api_key)
-        else:
-            self.client = None
+        self.base_url = settings.OLLAMA_BASE_URL.rstrip("/")
+        self.model = settings.OLLAMA_MODEL
+        self.timeout = 300  # 5 min — local LLMs can be slow
 
-    async def is_available(self) -> bool:
-        return self.client is not None
+    def is_available(self) -> bool:
+        """Always returns True — Ollama is assumed to be running on-premise.
+        Actual connectivity errors will be caught in _chat()."""
+        return True
+
+    async def async_is_available(self) -> bool:
+        """Non-blocking async check if Ollama is reachable."""
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{self.base_url}/api/tags")
+                return r.status_code == 200
+        except Exception:
+            return False
+
+    async def _chat(self, prompt: str, schema_hint: str = "") -> Dict[str, Any]:
+        """
+        Send a chat request to Ollama and parse the JSON response.
+        Returns a dict. On failure returns {"error": "..."}.
+        """
+        import time
+        start_time = time.time()
+        
+        system_msg = (
+            "You are a precise document analysis engine. "
+            "You MUST reply with ONLY valid JSON — no markdown fences, no explanation text. "
+            "Do not wrap your response in ```json. Return raw JSON only."
+        )
+        if schema_hint:
+            system_msg += f"\n\nRequired JSON shape:\n{schema_hint}"
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": 0.1,
+                "num_ctx": 4096,      # Reduced to 4k for faster local processing/lower memory
+                "num_predict": 1024,  # Cap output tokens to prevent infinite loops
+            },
+        }
+
+        print(f"[AI] Calling Ollama ({self.model}) with prompt length {len(prompt)}...")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/chat",
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                duration = time.time() - start_time
+                load_duration = data.get("load_duration", 0) / 1e9 # ns to s
+                total_duration = data.get("total_duration", 0) / 1e9
+                
+                print(f"[AI] Request complete in {duration:.2f}s (Ollama total: {total_duration:.2f}s, Load time: {load_duration:.2f}s)")
+                
+                content = data.get("message", {}).get("content", "")
+                # Strip any accidental code fences
+                content = content.strip()
+                if content.startswith("```"):
+                    content = content.split("```", 2)[-1]
+                    if content.startswith("json"):
+                        content = content[4:]
+                    content = content.rsplit("```", 1)[0].strip()
+                return json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"[AI] JSON Parse Error: {e}")
+            return {"error": f"Failed to parse JSON from LLM: {e}. Response was: {content[:500]}"}
+        except Exception as e:
+            print(f"[AI] HTTP/Connection Error: {e}")
+            return {"error": str(e)}
 
     async def extract_standard(self, text: str, filename: str) -> Dict[str, Any]:
         """
         Phase 1: Implicit Standard Extraction
-        Reverse-engineers the behavioral rules a document demonstrates.
+        Reverse-engineers the behavioral rules a document demonstrates using strict system prompts.
         """
-        if not await self.is_available():
-            return {"error": "AI Service not configured"}
+        schema_hint = json.dumps({
+            "standard_id": "string",
+            "version": "string",
+            "document_type_and_purpose": "string",
+            "structural_rules": ["string"],
+            "language_rules": ["string"],
+            "compliance_and_authority_model": "string",
+            "versioning_and_governance_rules": ["string"]
+        }, indent=2)
 
         prompt = f"""
-        You are a document standards analyst. Your job is to REVERSE-ENGINEER the implicit standard 
-        that this document follows. The document does NOT declare its rules explicitly — your task 
-        is to infer and extract them from the document's actual structure, language, tone, and patterns.
+SYSTEM
 
-        Analyze the document and extract:
+You are a document standard extraction engine.
+Your task is to infer rules, not content.
 
-        1. **Document Type**: What kind of document is this? (policy, manual, specification, training, legal, other)
-        2. **Authority Model**: How does the document express authority?
-           - "governance" = hierarchical policy (Policy → Direction → Framework → Annexes)
-           - "safety_first" = safety-critical with WARNING/CAUTION/NOTE blocks
-           - "procedural" = step-by-step instructions (Installation → Maintenance → Disassembly)
-           - "regulatory" = references external regulations (ASME, ANSI, IEC, ISO)
-        3. **Authority Chain**: Extract WHO owns, sponsors, approves, and reviews this document.
-           List each entity with their role (owner, sponsor, approver, reviewer) and their level
-           in the organizational hierarchy. This is CRITICAL for policy documents.
-        4. **Hierarchy Map**: Map the document's internal hierarchy:
-           - What levels exist? (e.g. "Policy → Direction → Framework → Annex")
-           - Which sections depend on which? (e.g. "Vol 2 depends on Vol 1 Ch1 definitions")
-        5. **Obligation Semantics**: For EVERY modal verb found (MUST, SHALL, SHOULD, MAY, COULD, 
-           SHALL NOT, MUST NOT), count occurrences and assign enforcement level:
-           - MUST / SHALL / SHALL NOT / MUST NOT → "mandatory" (hard requirement, failure = non-compliance)
-           - SHOULD / SHOULD NOT → "recommended" (expected, deviation requires justification)
-           - MAY / COULD → "optional" (permitted but not required)
-           These are NOT style choices — they are ENFORCEABLE obligation levels.
-        6. **Language Rules**:
-           - Controlled vocabulary: Map each key term to its semantic meaning
-           - Tone: formal, instructional, cautionary, conversational
-           - Modal verbs used and their enforcement level
-        7. **Structure Rules**:
-           - Mandatory sections the document demonstrates (infer from what IS present)
-           - Whether section ordering is enforced
-           - Hierarchy pattern (e.g. "Volume → Chapter → Section → Annex")
-        8. **Metadata & Governance**:
-           - Versioning discipline (version numbers, dates, document codes)
-           - Approval/review blocks
-           - Traceability requirements (part numbers, figure references, form numbers)
-        9. **Compliance Model**: How would compliance be checked?
-           - "audit_based" = Evidence, Non-Conformity, Observations, Good Practice
-           - "checklist" = pass/fail against specific items  
-           - "regulatory_reference" = compliance with external standards
-           - "none" = no formal compliance model detected
-        10. **Domain Markers**: Specific domain references found (e.g. ASME, ANSI, IEC, MoD, JSP, NATO)
+USER
 
-        IMPORTANT: You ARE inferring implicit rules. Extract what the document DEMONSTRATES, not just what it declares.
-        Treat modal verbs as ENFORCEABLE obligations, not as stylistic choices.
+Analyze the following document as a reference standard.
 
-        Document Filename: {filename}
-        Document Content:
-        {text[:200000]}
+Extract:
+- Document type and purpose
+- Structural rules
+- Language rules
+- Compliance and authority model
+- Versioning and governance rules
+
+Do NOT rewrite content.
+Do NOT summarize.
+Return structured JSON only.
+
+REFERENCE DOCUMENT:
+{text[:10000]}
+"""
+
+        result = await self._chat(prompt, schema_hint)
+        if "error" not in result and "standard_id" not in result:
+            result["standard_id"] = filename
+        if "error" not in result and "version" not in result:
+            result["version"] = "1.0"
+        return result
+
+    async def evaluate_compliance(self, doc_text: str, standard_json: Dict[str, Any], standard_id: str = "unknown") -> Dict[str, Any]:
         """
-
+        Phase 2: Domain-Aware Selective Compliance Evaluation.
+        Returns a compliance scorecard.
+        """
+        # Retrieve context-relevant rules from Memory rather than sending the full standard
+        doc_sample = doc_text[:1000] # Use the first part of doc_text as semantic query
         try:
-            response = await self.client.aio.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "standard_id": {"type": "STRING"},
-                            "version": {"type": "STRING"},
-                            "status": {"type": "STRING", "enum": ["active", "deprecated", "draft"]},
-                            "document_type": {"type": "STRING", "enum": ["policy", "manual", "specification", "training", "legal", "other"]},
-                            "authority_model": {"type": "STRING", "enum": ["governance", "safety_first", "procedural", "regulatory"]},
-                            "compliance_model": {"type": "STRING", "enum": ["audit_based", "checklist", "regulatory_reference", "none"]},
-                            "domain_markers": {"type": "ARRAY", "items": {"type": "STRING"}},
-                            "authority_chain": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "level": {"type": "STRING"},
-                                        "entity": {"type": "STRING"},
-                                        "authority_type": {"type": "STRING", "enum": ["owner", "sponsor", "approver", "reviewer"]}
-                                    }
-                                }
-                            },
-                            "hierarchy_map": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "levels": {"type": "ARRAY", "items": {"type": "STRING"}},
-                                    "dependencies": {"type": "ARRAY", "items": {"type": "STRING"}}
-                                }
-                            },
-                            "obligation_semantics": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "term": {"type": "STRING"},
-                                        "enforcement_level": {"type": "STRING", "enum": ["mandatory", "recommended", "optional", "forbidden"]},
-                                        "count": {"type": "NUMBER"}
-                                    }
-                                }
-                            },
-                            "scope": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "level": {"type": "STRING", "enum": ["file", "folder", "organization"]},
-                                    "applies_to": {"type": "STRING"}
-                                }
-                            },
-                            "rules": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "structure": {
-                                        "type": "OBJECT",
-                                        "properties": {
-                                            "mandatory_sections": {"type": "ARRAY", "items": {"type": "STRING"}},
-                                            "section_order_enforced": {"type": "BOOLEAN"},
-                                            "hierarchy_pattern": {"type": "STRING"}
-                                        }
-                                    },
-                                    "formatting": {
-                                        "type": "OBJECT",
-                                        "properties": {
-                                            "heading_style": {"type": "STRING", "enum": ["numbered", "roman", "plain"]},
-                                            "font_rules": {
-                                                "type": "OBJECT",
-                                                "properties": {
-                                                    "body": {"type": "STRING"},
-                                                    "heading": {"type": "STRING"}
-                                                }
-                                            }
-                                        }
-                                    },
-                                    "language": {
-                                        "type": "OBJECT",
-                                        "properties": {
-                                            "controlled_vocabulary": {"type": "BOOLEAN"},
-                                            "controlled_vocabulary_map": {
-                                                "type": "OBJECT",
-                                                "properties": {
-                                                    "must": {"type": "STRING"},
-                                                    "should": {"type": "STRING"},
-                                                    "may": {"type": "STRING"},
-                                                    "shall": {"type": "STRING"},
-                                                    "WARNING": {"type": "STRING"},
-                                                    "CAUTION": {"type": "STRING"},
-                                                    "NOTE": {"type": "STRING"}
-                                                }
-                                            },
-                                            "tone": {"type": "STRING", "enum": ["formal", "instructional", "cautionary", "conversational"]},
-                                            "modal_verbs": {"type": "ARRAY", "items": {"type": "STRING"}}
-                                        }
-                                    },
-                                    "metadata": {
-                                        "type": "OBJECT",
-                                        "properties": {
-                                            "versioning_required": {"type": "BOOLEAN"},
-                                            "approval_block_required": {"type": "BOOLEAN"},
-                                            "traceability": {
-                                                "type": "OBJECT",
-                                                "properties": {
-                                                    "part_numbers": {"type": "BOOLEAN"},
-                                                    "figure_references": {"type": "BOOLEAN"},
-                                                    "form_numbers": {"type": "BOOLEAN"},
-                                                    "annex_references": {"type": "BOOLEAN"}
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        required=["standard_id", "version", "document_type", "authority_model", "scope", "rules", "authority_chain", "hierarchy_map", "obligation_semantics"]
-                    )
-                )
-            )
-            if hasattr(response, 'parsed'):
-                return response.parsed
-            return response
+             memory_results = memory_service.search_rules(query=f"Rules relevant to: {doc_sample}", topic_id=standard_id, limit=3)
+             # Extract string rules or fallback
+             if isinstance(memory_results, dict) and "results" in memory_results:
+                 memory_rules = [r.get("memory", "") for r in memory_results["results"]]
+                 relevant_standard_text = "\n".join(memory_rules)
+             else:
+                 relevant_standard_text = str(memory_results)
+                 
+             if not relevant_standard_text.strip():
+                 relevant_standard_text = str(standard_json)[:4000] # Fallback to original
         except Exception as e:
-            return {"error": f"AI extraction failed: {str(e)}"}
+             print(f"Memory lookup failed: {e}")
+             relevant_standard_text = str(standard_json)[:4000] # Fallback
 
-    async def evaluate_compliance(self, doc_text: str, standard_json: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Phase 2: Domain-Aware Selective Compliance Evaluation
-        LLM evaluates compliance with awareness of domain compatibility.
-        Now returns a multi-dimension compliance SCORECARD and obligation-level enforcement.
-        """
-        if not await self.is_available():
-            return {"error": "AI Service not configured"}
+        schema_hint = json.dumps({
+            "compliance_score": 0,
+            "compliant": True,
+            "compatibility_score": 0,
+            "compatibility_warning": "string or empty",
+            "scorecard": {
+                "authority_compliance": 0,
+                "obligation_compliance": 0,
+                "structural_compliance": 0,
+                "metadata_compliance": 0,
+                "terminology_compliance": 0,
+                "overall": 0
+            },
+            "obligation_summary": [{"level": "mandatory|recommended|optional", "total_rules": 0, "passed": 0, "failed": 0}],
+            "violations": [{"rule_path": "string", "description": "string", "severity": "low|medium|high", "obligation_level": "mandatory|recommended|optional"}],
+            "skipped_rules": [{"rule_path": "string", "reason": "string"}],
+            "auto_fix_possible": True
+        }, indent=2)
 
         prompt = f"""
-        You are a policy-aware compliance evaluation engine.
-        You evaluate documents against an implicit standard with understanding of authority,
-        hierarchy, and obligation semantics — not just formatting and style.
+You are a policy-aware compliance evaluation engine enforcing SELECTIVE APPLICATION.
 
-        OBLIGATION-AWARE ENFORCEMENT:
-        1. MUST / SHALL / SHALL NOT / MUST NOT violations are HARD FAILURES.
-           Any single MUST-level violation means the document is non-compliant.
-        2. SHOULD / SHOULD NOT violations are SOFT FAILURES.
-           Flag them but they alone do not cause non-compliance.
-        3. MAY / COULD are informational only.
+The provided standard is a LENS, not a hammer. You must apply it dynamically based on the target document's scope and domain.
+- If the target document MATCHES the standard's domain (e.g., Policy applied to Policy), enforce ALL rules including domain-specific ones (like audit terminology or training assurance).
+- If the target document is from a DIFFERENT domain (e.g., Defence Policy applied to an Engineering Manual), it has Low Compatibility. You MUST warn about this AND ONLY apply UNIVERSAL rules (Versioning discipline, Document control rules, Formatting rules, Authority presence). DO NOT penalize the document for missing rigid domain-specific sections.
 
-        MULTI-DIMENSION SCORING:
-        Score each dimension independently on a 0-100 scale:
-        - authority_compliance: Does the document have required ownership, approval blocks, sponsor references?
-        - obligation_compliance: Are MUST/SHOULD rules correctly used and enforceable? Are obligations preserved?
-        - structural_compliance: Does section hierarchy match? Are mandatory sections present in correct order?
-        - metadata_compliance: Versioning, document codes, traceability, approval dates present?
-        - terminology_compliance: Controlled vocabulary adhered to? Domain terminology correct?
+OBLIGATION ENFORCEMENT:
+- MUST / SHALL violations = HARD FAILURES (document is non-compliant)
+- SHOULD / SHOULD NOT violations = SOFT FAILURES (flag, but don't break compliance)
+- MAY / COULD = informational only
 
-        Compute overall = weighted average:
-          (authority * 0.25) + (obligation * 0.30) + (structural * 0.20) + (metadata * 0.15) + (terminology * 0.10)
+MULTI-DIMENSION SCORING (0-100 each):
+- authority_compliance: ownership, approval blocks, sponsor references?
+- obligation_compliance: MUST/SHOULD rules correctly used?
+- structural_compliance: section hierarchy matches, mandatory sections present (SKIP domain-specific sections if mismatch)?
+- metadata_compliance: versioning, document codes, traceability?
+- terminology_compliance: controlled vocabulary adhered to?
 
-        DOMAIN COMPATIBILITY:
-        1. Determine the DOMAIN of the target document.
-        2. Compare against the standard's domain.
-        3. If domains are DIFFERENT, only enforce UNIVERSAL rules.
-        4. Output compatibility_score (0-100).
-        5. If compatibility < 50, include compatibility_warning.
-        6. List SKIPPED rules with reasons.
+overall = (authority*0.25) + (obligation*0.30) + (structural*0.20) + (metadata*0.15) + (terminology*0.10)
 
-        For each violation, classify its obligation_level (mandatory/recommended/optional).
+SELECTIVE APPLICATION LOGIC:
+- Determine target domain vs standard domain to get `compatibility_score`.
+- If different (score < 50), provide a `compatibility_warning` (e.g., "Low compatibility: applying Policy standard to Engineering Manual. Skipping domain-specific rules.").
+- In `skipped_rules`, LIST explicitly the standard rules you ignored because they didn't make sense for this document's domain.
 
-        Standard Definition (JSON):
-        {str(standard_json)}
+Relevant Standard Rules (Retrieved from Memory):
+{relevant_standard_text}
 
-        Document Content:
-        {doc_text[:200000]}
-        """
+Document Content:
+{doc_text[:10000]}
+"""
 
-        try:
-            response = await self.client.aio.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "compliance_score": {"type": "NUMBER"},
-                            "compliant": {"type": "BOOLEAN"},
-                            "compatibility_score": {"type": "NUMBER"},
-                            "compatibility_warning": {"type": "STRING"},
-                            "scorecard": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "authority_compliance": {"type": "NUMBER"},
-                                    "obligation_compliance": {"type": "NUMBER"},
-                                    "structural_compliance": {"type": "NUMBER"},
-                                    "metadata_compliance": {"type": "NUMBER"},
-                                    "terminology_compliance": {"type": "NUMBER"},
-                                    "overall": {"type": "NUMBER"}
-                                }
-                            },
-                            "obligation_summary": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "level": {"type": "STRING", "enum": ["mandatory", "recommended", "optional"]},
-                                        "total_rules": {"type": "NUMBER"},
-                                        "passed": {"type": "NUMBER"},
-                                        "failed": {"type": "NUMBER"}
-                                    }
-                                }
-                            },
-                            "violations": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "rule_path": {"type": "STRING"},
-                                        "description": {"type": "STRING"},
-                                        "severity": {"type": "STRING", "enum": ["low", "medium", "high"]},
-                                        "obligation_level": {"type": "STRING", "enum": ["mandatory", "recommended", "optional"]}
-                                    }
-                                }
-                            },
-                            "skipped_rules": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "rule_path": {"type": "STRING"},
-                                        "reason": {"type": "STRING"}
-                                    }
-                                }
-                            },
-                            "auto_fix_possible": {"type": "BOOLEAN"}
-                        },
-                        required=["compliance_score", "compliant", "compatibility_score", "violations", "auto_fix_possible", "scorecard", "obligation_summary"]
-                    )
-                )
-            )
-            if hasattr(response, 'parsed'):
-                return response.parsed
-            return response
-        except Exception as e:
-            return {"error": f"AI evaluation failed: {str(e)}"}
+        return await self._chat(prompt, schema_hint)
 
     async def analyze_compatibility(self, standard_json: Dict[str, Any], target_text: str) -> Dict[str, Any]:
         """
-        Phase 2: Compatibility Analysis
+        Phase 2: Compatibility Analysis.
         Scores how reasonable it is to apply a standard to a target document.
-        Uses 5 weighted dimensions: doc type (30%), structure (25%), language (20%),
-        compliance (15%), terminology (10%).
         """
-        if not await self.is_available():
-            return {"error": "AI Service not configured"}
+        schema_hint = json.dumps({
+            "total_score": 0,
+            "per_dimension_scores": {
+                "document_type": 0,
+                "structure": 0,
+                "language": 0,
+                "compliance_philosophy": 0,
+                "terminology": 0
+            },
+            "risk_classification": "HIGH|MEDIUM|LOW"
+        }, indent=2)
 
         prompt = f"""
-        You are a document compatibility assessor.
-        You must be conservative and risk-aware.
+SYSTEM
 
-        Compare the reference standard with the target document.
+You are a document compatibility assessor.
+You must be conservative and risk-aware.
 
-        Score compatibility (0-100) across these EXACT weighted dimensions:
-        - document_type_score (weight 30%): How similar are the document types? (policy vs manual vs SOP vs training)
-        - structural_similarity_score (weight 25%): Do they share similar section structures, hierarchy, and patterns?
-        - language_model_score (weight 20%): Do they use the same language model? (must/should vs WARNING/CAUTION)
-        - compliance_philosophy_score (weight 15%): Are their compliance approaches compatible? (audit vs operational)
-        - terminology_overlap_score (weight 10%): How much shared vocabulary exists?
+USER
 
-        Compute the total_score as the weighted sum:
-        total = (doc_type * 0.30) + (structure * 0.25) + (language * 0.20) + (compliance * 0.15) + (terminology * 0.10)
+Compare the reference standard with the target document.
 
-        Classify risk:
-        - total >= 75: "HIGH" (safe to apply)
-        - total 40-74: "MEDIUM" (apply selectively with warnings)
-        - total < 40: "LOW" (do NOT transform, report only)
+Score compatibility (0-100) across:
+- Document type
+- Structure
+- Language
+- Compliance philosophy
+- Terminology
 
-        REFERENCE STANDARD (JSON):
-        {str(standard_json)}
+Return:
+- Total score
+- Per-dimension scores
+- Risk classification (HIGH / MEDIUM / LOW)
 
-        TARGET DOCUMENT:
-        {target_text[:200000]}
-        """
+REFERENCE STANDARD:
+{str(standard_json)[:3000]}
 
-        try:
-            response = await self.client.aio.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "total_score": {"type": "NUMBER"},
-                            "risk_classification": {"type": "STRING", "enum": ["HIGH", "MEDIUM", "LOW"]},
-                            "dimensions": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "document_type_score": {"type": "NUMBER"},
-                                    "structural_similarity_score": {"type": "NUMBER"},
-                                    "language_model_score": {"type": "NUMBER"},
-                                    "compliance_philosophy_score": {"type": "NUMBER"},
-                                    "terminology_overlap_score": {"type": "NUMBER"}
-                                }
-                            },
-                            "target_document_type": {"type": "STRING"},
-                            "reasoning": {"type": "STRING"}
-                        },
-                        required=["total_score", "risk_classification", "dimensions", "target_document_type", "reasoning"]
-                    )
-                )
-            )
-            if hasattr(response, 'parsed'):
-                return response.parsed
-            return response
-        except Exception as e:
-            return {"error": f"Compatibility analysis failed: {str(e)}"}
+TARGET DOCUMENT:
+{target_text[:5000]}
+"""
+
+        return await self._chat(prompt, schema_hint)
 
     async def select_rules(self, standard_json: Dict[str, Any], compatibility_score: float) -> Dict[str, Any]:
         """
-        Phase 3: Rule Selection
-        Categorizes rules into safe (always), conditional (if compatible), forbidden (never auto-apply).
+        Phase 3: Rule Selection.
+        Categorizes rules into safe, conditional, and forbidden.
         """
-        if not await self.is_available():
-            return {"error": "AI Service not configured"}
+        schema_hint = json.dumps({
+            "safe_rules": [{"rule_path": "string", "description": "string"}],
+            "conditional_rules": [{"rule_path": "string", "description": "string"}],
+            "forbidden_rules": [{"rule_path": "string", "description": "string"}],
+            "justification": "string"
+        }, indent=2)
 
         prompt = f"""
-        You are a compliance-safe rule selector.
-        Never apply rules that could change meaning.
+SYSTEM
 
-        Given a standard specification and a compatibility score of {compatibility_score}/100,
-        categorize EVERY rule in the standard into one of three categories:
+You are a compliance-safe rule selector.
+Never apply rules that could change meaning.
 
-        🟢 SAFE rules (always allowed, never change meaning):
-        - Section ordering
-        - Heading hierarchy
-        - Versioning metadata
-        - Document identifiers
-        - Formatting consistency
+USER
 
-        🟡 CONDITIONAL rules (apply only if compatibility >= 40, warn the user):
-        - Language normalization (must/should)
-        - Compliance sections
-        - Governance statements
-        - Audit terminology
+Given:
+- A standard specification
+- A compatibility score of {compatibility_score}/100
 
-        🔴 FORBIDDEN rules (NEVER auto-apply, report only):
-        - Domain-specific content
-        - Legal obligations
-        - Safety instructions
-        - Engineering constraints
-        - Training authority assignments
+Decide:
+- Which rules are SAFE to apply
+- Which rules require warnings
+- Which rules must NOT be applied
 
-        For each rule, provide the rule_path, description, and a justification.
+Return JSON with:
+- safe_rules
+- conditional_rules
+- forbidden_rules
+- justification
 
-        STANDARD SPECIFICATION (JSON):
-        {str(standard_json)}
-        """
+STANDARD SPECIFICATION:
+{str(standard_json)[:4000]}
+"""
 
-        try:
-            response = await self.client.aio.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "safe_rules": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "rule_path": {"type": "STRING"},
-                                        "description": {"type": "STRING"},
-                                        "justification": {"type": "STRING"}
-                                    }
-                                }
-                            },
-                            "conditional_rules": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "rule_path": {"type": "STRING"},
-                                        "description": {"type": "STRING"},
-                                        "justification": {"type": "STRING"}
-                                    }
-                                }
-                            },
-                            "forbidden_rules": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "rule_path": {"type": "STRING"},
-                                        "description": {"type": "STRING"},
-                                        "justification": {"type": "STRING"}
-                                    }
-                                }
-                            }
-                        },
-                        required=["safe_rules", "conditional_rules", "forbidden_rules"]
-                    )
-                )
-            )
-            if hasattr(response, 'parsed'):
-                return response.parsed
-            return response
-        except Exception as e:
-            return {"error": f"Rule selection failed: {str(e)}"}
+        return await self._chat(prompt, schema_hint)
 
     async def transform_document(self, doc_text: str, approved_rules: Dict[str, Any], competence_level: str = "general") -> Dict[str, Any]:
         """
-        Phase 4: Gated Transformation with Deviation Accountability
+        Phase 4: Gated Transformation with Deviation Accountability.
         Only applies pre-approved rules. Preserves meaning at all costs.
-        Returns structured JSON with the transformed text AND a deviation report.
         """
-        if not await self.is_available():
-            return {"transformed_text": "", "error": "AI Service not configured"}
-
-        source_standard = approved_rules.get("source_standard", {})
-        doc_type = source_standard.get("document_type", "other")
-        
-        tech_manual_instructions = ""
-        if doc_type in ["manual", "specification"]:
-            tech_manual_instructions = f"""
-        TECHNICAL MANUAL OVERRIDE (CRITICAL REALISM INJECTION):
-        Because this standard is a '{doc_type}', you must optimize for ENGINEERING REALISM, not just readability.
-        You MUST inject the following specific traits:
-        1. Engineering Density: Include numeric limits, torque values, temperatures, sizes, or material constraints where plausible.
-        2. Tables: Present at least one set of step-by-step limits, specs, or troubleshooting data as a Markdown Table.
-        3. Conditional Failure Modeling: Use phrasing like "If X occurs..." or "If leakage persists..." to model real-world consequences.
-        4. Cross-Reference Synthesizer: Synthesize references frequently, e.g., "See Section X", "Refer to Figure 14", "As shown in Table 3".
-        5. OEM Voice Calibration: Maintain a conservative, legal distancing tone (e.g., "Responsibility remains with the end user...").
-        6. Competence Dial ({competence_level} Level):
-           - operator: clear procedures, explain basics, focus on safe operation.
-           - technician: skip obvious basics, focus on maintenance, disassembly, and specific risk points.
-           - engineer: highly dense, jargon-heavy, assumes complete competence, focuses on parameters and root causes.
-        7. Visual Realism: To emulate a real engineering manual, you MUST inject rich Markdown image placeholders for diagrams, schematics, and pictures where appropriate (e.g., `![System Diagram](https://placehold.co/600x400/1e293b/e2e8f0?text=System+Diagram)`).
-        """
+        schema_hint = json.dumps({
+            "transformed_text": "The full transformed document in Markdown",
+            "deviations": [{
+                "location": "string",
+                "original_text": "string",
+                "changed_to": "string",
+                "reason": "string",
+                "rule_reference": "string",
+                "severity": "cosmetic|structural|semantic"
+            }],
+            "preserved_items": ["string"],
+            "change_summary": "string"
+        }, indent=2)
 
         prompt = f"""
-        You are a policy-aware document transformation engine.
-        Preserve meaning at all costs. You must be ACCOUNTABLE for every change.
+SYSTEM
 
-        Apply ONLY the approved rules to the target document.
+You are a document transformation engine.
+Preserve meaning at all costs.
 
-        CRITICAL CONSTRAINTS:
-        1. Return the ENTIRE document text. Do NOT truncate or summarize. Use Markdown formatting.
-        2. Do NOT introduce new obligations that don't exist in the original.
-        3. Do NOT invent content — only restructure, reformat, or relabel (except for the technical realism parameters if specified below).
-        4. Insert placeholders (e.g. "[TO BE ADDED]") where required sections are missing.
-        5. MANDATORY: Images are the lifeblood of a technical manual. You MUST preserve ALL inline images precisely as they appear in the source. These look like `![alt](data:image...;base64,...)`. These strings are extremely long; you MUST NOT truncate, modify, or strip them. Every single `data:image` token must be carried over to the transformed document in its exact location.
-        6. Do NOT upgrade MAY to SHOULD, or SHOULD to MUST. Obligation levels are FROZEN.
-        {tech_manual_instructions}
+USER
 
-        DEVIATION ACCOUNTABILITY:
-        For EVERY change you make, you MUST log it as a deviation:
-        - location: where in the document (e.g. "Section 3.2, paragraph 1")
-        - original_text: the exact text before your change (short excerpt)
-        - changed_to: what you changed it to
-        - reason: WHY you made this change (reference the rule)
-        - rule_reference: which approved rule triggered this change
-        - severity: "cosmetic" (formatting only), "structural" (section reordering), or "semantic" (affects meaning)
+Apply ONLY the approved rules to the target document.
 
-        Also list items you explicitly CHOSE NOT TO CHANGE and why in preserved_items.
-        Provide a brief change_summary describing the overall transformation.
+Constraints:
+- Do not introduce new obligations
+- Do not invent content
+- Insert placeholders where required
+- Preserve original intent
 
-        APPROVED RULES (JSON):
-        {str(approved_rules)}
+APPROVED RULES:
+{str(approved_rules)[:3000]}
 
-        DOCUMENT TO TRANSFORM:
-        {doc_text[:200000]}
-        """
+TARGET DOCUMENT:
+{doc_text[:12000]}
+"""
 
-        try:
-            response = await self.client.aio.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=types.Schema(
-                        type="OBJECT",
-                        properties={
-                            "transformed_text": {"type": "STRING"},
-                            "deviations": {
-                                "type": "ARRAY",
-                                "items": {
-                                    "type": "OBJECT",
-                                    "properties": {
-                                        "location": {"type": "STRING"},
-                                        "original_text": {"type": "STRING"},
-                                        "changed_to": {"type": "STRING"},
-                                        "reason": {"type": "STRING"},
-                                        "rule_reference": {"type": "STRING"},
-                                        "severity": {"type": "STRING", "enum": ["cosmetic", "structural", "semantic"]}
-                                    }
-                                }
-                            },
-                            "preserved_items": {
-                                "type": "ARRAY",
-                                "items": {"type": "STRING"}
-                            },
-                            "change_summary": {"type": "STRING"}
-                        },
-                        required=["transformed_text", "deviations", "change_summary"]
-                    )
-                )
-            )
-            if hasattr(response, 'parsed'):
-                result = response.parsed
-            else:
-                result = {"transformed_text": response.text, "deviations": [], "change_summary": "Transformation completed"}
-            return result
-        except Exception as e:
-            return {"transformed_text": "", "deviations": [], "error": f"AI transformation failed: {str(e)}"}
+        result = await self._chat(prompt, schema_hint)
+
+        # Normalize response for legacy callers
+        if isinstance(result, dict) and "transformed_text" not in result and "error" not in result:
+            result["transformed_text"] = ""
+        return result
+
 
 ai_service = AIService()

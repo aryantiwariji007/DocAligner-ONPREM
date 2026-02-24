@@ -22,43 +22,111 @@ class ValidationService:
                 text = ""
                 # Use the new factory method we added!
                 from backend.app.services.rule_extraction_service import rule_extraction_factory
-                text = rule_extraction_factory.extract_text(file_content, filename)
+                # AI evaluation doesn't need image base64, just text
+                text = rule_extraction_factory.extract_text(file_content, filename, with_images=False)
 
                 if text:
-                    ai_report = await ai_service.evaluate_compliance(text, standard_version.rules_json)
+                    import hashlib
+                    import json
+                    from backend.app.services.memory_service import memory_service
+
+                    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+                    doc_id_str = filename # Or actual document.id if passed instead of filename, but string is fine
                     
+                    # 1. Check episodic memory for this exact chunk
+                    ai_report = None
+                    try:
+                        bubble_q = f"validation status for chunk {text_hash}"
+                        bubble_results = memory_service.search_rules(query=bubble_q, limit=1)
+                        if isinstance(bubble_results, dict) and "results" in bubble_results and len(bubble_results["results"]) > 0:
+                            top_result: str = bubble_results["results"][0].get("memory", "")
+                            prefix = "Explicit Status: "
+                            if prefix in top_result:
+                                ai_report_json = top_result.split(prefix, 1)[1]
+                                ai_report = json.loads(ai_report_json)
+                                print(f"Cache Hit for {text_hash}!")
+                    except Exception as e:
+                        print(f"Episodic memory lookup failed: {e}")
+
+                    # 2. If no cache hit, compute using AI
+                    if not ai_report:
+                        print(f"Cache Miss for {text_hash}. Calling AI...")
+                        ai_report = await ai_service.evaluate_compliance(text, standard_version.rules_json, str(standard_version.standard_id))
+                        # Save bubble
+                        try:
+                            if ai_report and "error" not in ai_report:
+                                memory_service.add_validation_bubble(doc_id_str, text_hash, json.dumps(ai_report))
+                        except Exception as e:
+                            print(f"Failed to save episodic bubble: {e}")
+
                     # Merge Reports
-                    # Phase 2 model: score + violations + fix options
-                    if ai_report:
+                    if ai_report and "error" not in ai_report:
+                        # Get overall score from scorecard (more reliable) or top-level
+                        scorecard = ai_report.get("scorecard") or {}
+                        overall_score = scorecard.get("overall", ai_report.get("compliance_score", 0))
+                        ai_compliant = ai_report.get("compliant", True)
+                        
+                        # If scorecard all zeros but has violations, fix compliant flag
+                        ai_violations = ai_report.get("violations", [])
+                        if ai_violations and ai_compliant:
+                            # Has violations — trust violations over the compliant flag
+                            has_mandatory_violation = any(
+                                v.get("obligation_level", "") == "mandatory" or v.get("severity", "") == "high"
+                                for v in ai_violations
+                            )
+                            if has_mandatory_violation:
+                                ai_compliant = False
+
                         report["ai_evaluation"] = {
-                            "compliance_score": ai_report.get("compliance_score", 0),
-                            "compliant": ai_report.get("compliant", False),
+                            "compliance_score": overall_score,
+                            "compliant": ai_compliant,
                             "compatibility_score": ai_report.get("compatibility_score", 0),
                             "compatibility_warning": ai_report.get("compatibility_warning"),
-                            "scorecard": ai_report.get("scorecard"),
+                            "scorecard": scorecard,
                             "obligation_summary": ai_report.get("obligation_summary", []),
-                            "violations": ai_report.get("violations", []),
+                            "violations": ai_violations,
                             "skipped_rules": ai_report.get("skipped_rules", []),
                             "auto_fix_possible": ai_report.get("auto_fix_possible", False)
                         }
                     
-                    # If AI says non-compliant, override or append?
-                    # Let's trust AI for "compliance rules" that deterministic code can't check.
-                    if ai_report and ai_report.get("compliant") is False:
-                        report["compliant"] = False
+                        # Hard fix: if score is literally 0, it's not compliant, regardless of what the AI hallucinated for the flag.
+                        if overall_score == 0:
+                            ai_compliant = False
+                        # User request: if score >= 75%, it should automatically be compliant
+                        elif overall_score >= 75:
+                            ai_compliant = True
                         
-                        # Add AI violations to main errors list
-                        ai_violations = ai_report.get("violations", [])
-                        for v in ai_violations:
-                            desc = v.get("description", "Unknown violation")
-                            rule_path = v.get("rule_path", "")
-                            lvl = v.get("obligation_level", "mandatory")
-                            report["errors"].append(f"[{lvl.upper()}] {desc} ({rule_path})")
-                    
-                    report["score"] = ai_report.get("compliance_score", 0) if ai_report else 0
-                    report["fix_options"] = ai_report.get("auto_fix_possible", False) if ai_report else False
+                        # Sync the flag back to the evaluation object
+                        report["ai_evaluation"]["compliant"] = ai_compliant
+
+                        if not ai_compliant:
+                            report["compliant"] = False
+                            # Add AI violations to main errors list
+                            for v in ai_violations:
+                                desc = v.get("description", "Unknown violation")
+                                rule_path = v.get("rule_path", "")
+                                lvl = v.get("obligation_level", "mandatory")
+                                report["errors"].append(f"[{lvl.upper()}] {desc} ({rule_path})")
+                            
+                            if not ai_violations and overall_score == 0:
+                                report["errors"].append("[SYSTEM] Failed overall AI compliance check (Score: 0%).")
+                        else:
+                            # 75% Rule: If AI says compliant (which it does for score >= 75), 
+                            # we override EVERYTHING to green.
+                            report["compliant"] = True
+                            # Optional: We could clear report["errors"] here too if we want a clean pass badge,
+                            # but keeping them as "warnings" or info might be better. 
+                            # For now, just ensuring the compliant flag is True.
+                            report["status"] = "COMPLIANT"
+
+                        report["score"] = overall_score
+                        report["fix_options"] = ai_report.get("auto_fix_possible", False)
+                    elif ai_report and "error" in ai_report:
+                        report["warnings"].append(f"AI evaluation error: {ai_report['error']}")
+                        report["ai_evaluation"] = {"error": ai_report["error"]}
         except Exception as e:
             print(f"AI Validation failed: {e}")
+            import traceback; traceback.print_exc()
             report["warnings"].append(f"AI-enhanced validation failed: {str(e)}")
             report["ai_evaluation"] = {"error": str(e)}
 

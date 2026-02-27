@@ -24,8 +24,12 @@ class Settings(BaseSettings):
     MINIO_BUCKET_DOCUMENTS: str = "documents"
     MINIO_SECURE: bool = False
     
-    # AI
-    GEMINI_API_KEY: Optional[str] = None
+    # REDIS
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    
+    # AI (Ollama - on-premise)
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")
 
     model_config = SettingsConfigDict(
         env_file=".env",

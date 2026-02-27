@@ -17,4 +17,5 @@ asgiref>=3.7.2
 pypdf>=3.17.0
 pymupdf>=1.23.0
 python-dotenv>=1.0.0
-contextmemory
+qdrant-client>=1.7.0
+langgraph>=0.2.0

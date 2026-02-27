@@ -194,4 +194,3 @@ class StandardService:
 
 
 standard_service = StandardService()
-

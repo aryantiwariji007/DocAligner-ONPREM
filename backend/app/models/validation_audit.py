@@ -8,11 +8,17 @@ from enum import Enum
 from .base import IDMixin, TimestampMixin
 
 class ValidationStatus(str, Enum):
-    PASS = "PASS"
-    FAIL = "FAIL"
-    WARN = "WARN"
+    INGESTED = "INGESTED"
+    CLASSIFIED = "CLASSIFIED"
+    INCOMPATIBLE_STANDARD = "INCOMPATIBLE_STANDARD"
+    STRUCTURE_MISMATCH = "STRUCTURE_MISMATCH"
+    EVALUATED = "EVALUATED"
     COMPLIANT = "COMPLIANT"
     NON_COMPLIANT = "NON_COMPLIANT"
+    PENDING = "PENDING"
+    WARN = "WARN" # Leaving WARN for legacy compat if needed
+    PASS = "PASS" # Restored for legacy compat
+    FAIL = "FAIL" # Restored for legacy compat
 
 class ValidationResult(IDMixin, TimestampMixin, table=True):
     __tablename__ = "validationresult"

@@ -17,116 +17,54 @@ class ValidationService:
         # 2. Augment with AI if available (Phase 2)
         try:
             from backend.app.services.ai_service import ai_service
-            if ai_service.is_available():
+            if await ai_service.is_available():
                 # Extract text for AI
                 text = ""
                 # Use the new factory method we added!
                 from backend.app.services.rule_extraction_service import rule_extraction_factory
-                # AI evaluation doesn't need image base64, just text
-                text = rule_extraction_factory.extract_text(file_content, filename, with_images=False)
+                text = rule_extraction_factory.extract_text(file_content, filename)
 
                 if text:
-                    import hashlib
-                    import json
-                    from backend.app.services.memory_service import memory_service
-
-                    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
-                    doc_id_str = filename # Or actual document.id if passed instead of filename, but string is fine
+                    from backend.app.services.decision_flow_service import decision_flow_service
+                    res = await decision_flow_service.analyze(file_content, filename, standard_version.rules_json)
                     
-                    # 1. Check episodic memory for this exact chunk
-                    ai_report = None
-                    try:
-                        bubble_q = f"validation status for chunk {text_hash}"
-                        bubble_results = memory_service.search_rules(query=bubble_q, limit=1)
-                        if isinstance(bubble_results, dict) and "results" in bubble_results and len(bubble_results["results"]) > 0:
-                            top_result: str = bubble_results["results"][0].get("memory", "")
-                            prefix = "Explicit Status: "
-                            if prefix in top_result:
-                                ai_report_json = top_result.split(prefix, 1)[1]
-                                ai_report = json.loads(ai_report_json)
-                                print(f"Cache Hit for {text_hash}!")
-                    except Exception as e:
-                        print(f"Episodic memory lookup failed: {e}")
+                    if "error" in res:
+                        report["warnings"].append(f"AI structural analysis failed: {res['error']}")
+                        return report
 
-                    # 2. If no cache hit, compute using AI
-                    if not ai_report:
-                        print(f"Cache Miss for {text_hash}. Calling AI...")
-                        ai_report = await ai_service.evaluate_compliance(text, standard_version.rules_json, str(standard_version.standard_id))
-                        # Save bubble
-                        try:
-                            if ai_report and "error" not in ai_report:
-                                memory_service.add_validation_bubble(doc_id_str, text_hash, json.dumps(ai_report))
-                        except Exception as e:
-                            print(f"Failed to save episodic bubble: {e}")
-
-                    # Merge Reports
-                    if ai_report and "error" not in ai_report:
-                        # Get overall score from scorecard (more reliable) or top-level
-                        scorecard = ai_report.get("scorecard") or {}
-                        overall_score = scorecard.get("overall", ai_report.get("compliance_score", 0))
-                        ai_compliant = ai_report.get("compliant", True)
-                        
-                        # If scorecard all zeros but has violations, fix compliant flag
-                        ai_violations = ai_report.get("violations", [])
-                        if ai_violations and ai_compliant:
-                            # Has violations — trust violations over the compliant flag
-                            has_mandatory_violation = any(
-                                v.get("obligation_level", "") == "mandatory" or v.get("severity", "") == "high"
-                                for v in ai_violations
-                            )
-                            if has_mandatory_violation:
-                                ai_compliant = False
-
-                        report["ai_evaluation"] = {
-                            "compliance_score": overall_score,
-                            "compliant": ai_compliant,
-                            "compatibility_score": ai_report.get("compatibility_score", 0),
-                            "compatibility_warning": ai_report.get("compatibility_warning"),
-                            "scorecard": scorecard,
-                            "obligation_summary": ai_report.get("obligation_summary", []),
-                            "violations": ai_violations,
-                            "skipped_rules": ai_report.get("skipped_rules", []),
-                            "auto_fix_possible": ai_report.get("auto_fix_possible", False)
-                        }
+                    comp = res.get("compatibility", {})
+                    align = res.get("alignment_report", {})
                     
-                        # Hard fix: if score is literally 0, it's not compliant, regardless of what the AI hallucinated for the flag.
-                        if overall_score == 0:
-                            ai_compliant = False
-                        # User request: if score >= 75%, it should automatically be compliant
-                        elif overall_score >= 75:
-                            ai_compliant = True
+                    report["ai_evaluation"] = {
+                        "compliance_score": comp.get("total_score", 0),
+                        "compliant": comp.get("total_score", 0) >= 85,
+                        "compatibility_score": comp.get("total_score", 0),
+                        "risk": res.get("risk"),
+                        "alignment_details": align,
+                        "violations": [
+                            {
+                                "description": f"Missing mandatory section: {sec}",
+                                "severity": "critical",
+                                "rule_reference": "structural_presence"
+                            } for sec in align.get("missing_sections", [])
+                        ] + [
+                            {
+                                "description": f"Misplaced section: {sec['section_title']}",
+                                "severity": "major",
+                                "rule_reference": "structural_order"
+                            } for sec in align.get("misplaced_sections", [])
+                        ]
+                    }
+                    
+                    # Merge violations into main report
+                    for v in report["ai_evaluation"]["violations"]:
+                        report["errors"].append(f"[{v['severity'].upper()}] {v['description']}")
                         
-                        # Sync the flag back to the evaluation object
-                        report["ai_evaluation"]["compliant"] = ai_compliant
-
-                        if not ai_compliant:
-                            report["compliant"] = False
-                            # Add AI violations to main errors list
-                            for v in ai_violations:
-                                desc = v.get("description", "Unknown violation")
-                                rule_path = v.get("rule_path", "")
-                                lvl = v.get("obligation_level", "mandatory")
-                                report["errors"].append(f"[{lvl.upper()}] {desc} ({rule_path})")
-                            
-                            if not ai_violations and overall_score == 0:
-                                report["errors"].append("[SYSTEM] Failed overall AI compliance check (Score: 0%).")
-                        else:
-                            # 75% Rule: If AI says compliant (which it does for score >= 75), 
-                            # we override EVERYTHING to green.
-                            report["compliant"] = True
-                            # Optional: We could clear report["errors"] here too if we want a clean pass badge,
-                            # but keeping them as "warnings" or info might be better. 
-                            # For now, just ensuring the compliant flag is True.
-                            report["status"] = "COMPLIANT"
-
-                        report["score"] = overall_score
-                        report["fix_options"] = ai_report.get("auto_fix_possible", False)
-                    elif ai_report and "error" in ai_report:
-                        report["warnings"].append(f"AI evaluation error: {ai_report['error']}")
-                        report["ai_evaluation"] = {"error": ai_report["error"]}
+                    report["score"] = comp.get("total_score", 0)
+                    report["fix_options"] = comp.get("total_score", 0) >= 20  # Safe to attempt fix if score >= 20
         except Exception as e:
-            print(f"AI Validation failed: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            print(f"AI Validation failed: {traceback.format_exc()}")
             report["warnings"].append(f"AI-enhanced validation failed: {str(e)}")
             report["ai_evaluation"] = {"error": str(e)}
 
@@ -150,8 +88,9 @@ class ValidationService:
 
         if is_pdf:
             report["details"]["format"] = "PDF"
-            # Basic PDF validation (can be expanded with pypdf)
-            report["warnings"].append("PDF documents only support metadata/format validation. Structural standards are skipped.")
+            # Return report here if we only want basic meta-validation for PDF, 
+            # but we'll let it fall through so validate_document_async can run AI structure analysis.
+            # report["warnings"].append("PDF documents only support metadata/format validation. Structural standards are skipped.")
             return report
 
         if is_zip:

@@ -27,11 +27,25 @@ async def validate_document_async(document_id_str: str, standard_version_id_str:
     
     try:
         async with async_session() as db:
+            from sqlalchemy.orm import selectinload
+            stmt = select(StandardVersion).where(StandardVersion.id == standard_version_id).options(selectinload(StandardVersion.standard))
+            result = await db.execute(stmt)
+            version = result.scalar_one_or_none()
             document = await db.get(Document, document_id)
-            version = await db.get(StandardVersion, standard_version_id)
             
             if not document or not version:
                 return
+
+            # O15. Mark as PENDING immediately to inform UI
+            pending_result = ValidationResult(
+                document_id=document_id,
+                standard_version_id=standard_version_id,
+                status=ValidationStatus.PENDING,
+                report_json={"message": "AI Background evaluation in progress..."}
+            )
+            db.add(pending_result)
+            await db.commit()
+            await db.refresh(pending_result)
 
             # Get file
             try:
@@ -42,17 +56,16 @@ async def validate_document_async(document_id_str: str, standard_version_id_str:
                 # Validate
                 report = await validation_service.validate_document_async(file_content, version, document.filename)
                 
-                status = ValidationStatus.PASS if report.get("compliant") else ValidationStatus.FAIL
-                if report.get("compliant") and report.get("warnings"):
-                    status = ValidationStatus.WARN
+                status_str = report.get("evaluation_status", "NON_COMPLIANT")
+                try:
+                    status = ValidationStatus(status_str)
+                except ValueError:
+                    status = ValidationStatus.FAIL # Fallback
                 
-                validation_result = ValidationResult(
-                    document_id=document_id,
-                    standard_version_id=standard_version_id,
-                    status=status,
-                    report_json=report
-                )
-                db.add(validation_result)
+                # Update the pending result instead of creating new one
+                pending_result.status = status
+                pending_result.report_json = report
+                db.add(pending_result)
                 await db.commit()
             except Exception as e:
                 print(f"Validation failed for doc {document_id}: {e}")

@@ -15,25 +15,24 @@ services:
       - MINIO_ENDPOINT=minio:9000
       - WATCHFILES_FORCE_POLLING=true
       - PYTHONPATH=/app
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=qwen2.5:7b-instruct
+      - QDRANT_URL=http://qdrant:6333
     ports:
       - "8001:8000"
     restart: always
-    deploy:
-      resources:
-        limits:
-          cpus: '0.50'
-          memory: 1G
     depends_on:
       - db
       - redis
       - minio
+      - qdrant
 
   worker:
     image: doc-standards-worker:1.0
     build:
       context: ../backend
       dockerfile: ../docker/worker.Dockerfile
-    command: celery -A backend.app.worker.celery_app worker --loglevel=info -Q celery,validation-queue
+    command: celery -A backend.app.worker.celery_app worker --loglevel=info -Q celery,stage2-slow --concurrency=1
     volumes:
       - ../backend:/app/backend
     environment:
@@ -42,32 +41,28 @@ services:
       - MINIO_ENDPOINT=minio:9000
       - WATCHFILES_FORCE_POLLING=true
       - PYTHONPATH=/app
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=qwen2.5:7b-instruct
+      - QDRANT_URL=http://qdrant:6333
     restart: always
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 1G
     depends_on:
       - db
       - redis
       - minio
+      - qdrant
 
   frontend:
     image: doc-standards-frontend:1.0
     build:
       context: ../frontend
       dockerfile: ../docker/frontend.Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8001/api/v1
     ports:
       - "3001:3000"
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8001/api/v1
     restart: always
-    deploy:
-      resources:
-        limits:
-          memory: 512M
 
   db:
     image: postgres:15-alpine
@@ -98,6 +93,15 @@ services:
     ports:
       - "6379:6379"
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: always
+
 volumes:
   postgres_data:
   minio_data:
+  qdrant_data:

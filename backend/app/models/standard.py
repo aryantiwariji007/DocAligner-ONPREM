@@ -26,7 +26,10 @@ class StandardVersion(IDMixin, TimestampMixin, table=True):
     rules_json: Dict = Field(default={}, sa_column=Column(JSONB))
     is_active: bool = Field(default=True)
     
-    standard: Standard = Relationship(back_populates="versions")
+    standard: Standard = Relationship(
+        back_populates="versions",
+        sa_relationship_kwargs={"lazy": "selectin"}
+    )
     assignments: List["StandardAssignment"] = Relationship(
         back_populates="standard_version",
         sa_relationship_kwargs={"lazy": "selectin", "cascade": "all, delete-orphan"}

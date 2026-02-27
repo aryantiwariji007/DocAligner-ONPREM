@@ -5,9 +5,17 @@ import uuid
 from enum import Enum
 
 class ValidationStatus(str, Enum):
+    INGESTED = "INGESTED"
+    CLASSIFIED = "CLASSIFIED"
+    INCOMPATIBLE_STANDARD = "INCOMPATIBLE_STANDARD"
+    STRUCTURE_MISMATCH = "STRUCTURE_MISMATCH"
+    EVALUATED = "EVALUATED"
+    COMPLIANT = "COMPLIANT"
+    NON_COMPLIANT = "NON_COMPLIANT"
+    PENDING = "PENDING"
+    WARN = "WARN"
     PASS = "PASS"
     FAIL = "FAIL"
-    WARN = "WARN"
 
 class ValidationResultBase(BaseModel):
     document_id: uuid.UUID

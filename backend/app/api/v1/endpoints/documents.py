@@ -136,7 +136,8 @@ async def get_document_content(
     
     file_content = minio_client.get_file(document.minio_version_id)
     from backend.app.services.rule_extraction_service import rule_extraction_factory
-    text_content = rule_extraction_factory.extract_text(file_content, document.filename)
+    # For preview, we want images if available
+    text_content = rule_extraction_factory.extract_text(file_content, document.filename, with_images=True)
     
     return {"content": text_content, "filename": document.filename}
 
@@ -286,8 +287,22 @@ async def delete_document(
 
     # 2. Delete from DB
     try:
+        print(f"DEBUG: Deleting dependent records for Document: {document_id}")
+        from sqlalchemy import delete
+        from backend.app.models.validation_audit import ValidationResult
+        from backend.app.models.standard import StandardAssignment
+        from backend.app.models import TargetType
+        
+        # Manually delete ValidationResults pointing to this document
+        await db.execute(delete(ValidationResult).where(ValidationResult.document_id == document_id))
+        
+        # Manually delete StandardAssignments pointing to this document
+        await db.execute(delete(StandardAssignment).where(
+            StandardAssignment.target_id == document_id,
+        ))
+        
         print(f"DEBUG: Deleting from Database: {document_id}")
-        db.delete(document)
+        await db.delete(document)
         # 3. Audit
         from backend.app.services.audit_service import audit_service
         await audit_service.log_action(

@@ -130,13 +130,26 @@ async def delete_folder(
     result = await db.execute(stmt)
     documents = result.scalars().all()
     
+    # Preemptively delete all ValidationResults for these documents
+    if documents:
+        doc_ids = [doc.id for doc in documents]
+        from backend.app.models.validation_audit import ValidationResult
+        from sqlalchemy import delete
+        await db.execute(delete(ValidationResult).where(ValidationResult.document_id.in_(doc_ids)))
+        
+        # Also delete StandardAssignments for these documents and folders
+        from backend.app.models.standard import StandardAssignment
+        await db.execute(delete(StandardAssignment).where(
+            StandardAssignment.target_id.in_(doc_ids + folder_ids)
+        ))
+    
     for doc in documents:
         try:
             if doc.minio_version_id:
                 minio_client.delete_file(doc.minio_version_id)
         except Exception as e:
             print(f"Warning: could not delete file {doc.filename} from MinIO: {e}")
-        db.delete(doc)
+        await db.delete(doc)
 
     # 3. Delete folders in correct order (children first)
     # _get_all_subfolder_ids doesn't guarantee order for deletion, 
@@ -146,7 +159,7 @@ async def delete_folder(
     for fid in reversed(folder_ids): # reversed might help if they were added in hierarchy order
         f = await db.get(Folder, fid)
         if f:
-            db.delete(f)
+            await db.delete(f)
 
     # 4. Audit
     from backend.app.services.audit_service import audit_service

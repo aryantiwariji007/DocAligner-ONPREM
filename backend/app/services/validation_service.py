@@ -61,7 +61,7 @@ class ValidationService:
                         report["errors"].append(f"[{v['severity'].upper()}] {v['description']}")
                         
                     report["score"] = comp.get("total_score", 0)
-                    report["fix_options"] = comp.get("total_score", 0) >= 20  # Safe to attempt fix if score >= 20
+                    report["fix_options"] = True  # Irrespective of score, allow regeneration as requested
         except Exception as e:
             import traceback
             print(f"AI Validation failed: {traceback.format_exc()}")

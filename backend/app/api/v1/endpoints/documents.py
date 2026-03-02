@@ -166,100 +166,14 @@ async def fix_document(
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
         
-    # 3. Process document
-    try:
-        # 1. Fetch document content
-        storage_path = document.minio_version_id
-        if not storage_path:
-            # Fallback if somehow missing
-            storage_path = f"{document.id}/{document.filename}"
-            
-        print(f"DEBUG: Retrieving document content from MinIO: {storage_path}")
-        file_content = minio_client.get_file(storage_path)
-        
-        # 2. Run decision flow pipeline
-        from backend.app.services.decision_flow_service import decision_flow_service
-        print(f"DEBUG: Running decision flow for {document.filename} with standard version {effective_std_version.id}")
-        result = await decision_flow_service.apply(file_content, document.filename, effective_std_version.rules_json, competence_level=competence_level)
-    except Exception as e:
-        import traceback
-        traceback_print = traceback.format_exc()
-        print(f"ERROR during AI fix: {traceback_print}")
-        # Return a more specific error message if possible
-        detail = str(e)
-        if "NoSuchKey" in detail or "bucket" in detail.lower():
-            detail = f"File not found in storage. It may have been deleted manually. (Path: {storage_path})"
-        raise HTTPException(status_code=500, detail=f"Internal error during AI fix: {detail}")
-    
-    if "error" in result:
-        print(f"DEBUG: AI Fix result contained error: {result['error']}")
-        raise HTTPException(status_code=500, detail=result["error"])
-
-    # 4. Save fixed content if transformation happened
-    if result.get("transformed_content"):
-        fixed_object_name = f"fixed/{document_id}/{document.filename}.fixed.txt"
-        try:
-            minio_client.upload_file(result["transformed_content"].encode("utf-8"), fixed_object_name, "text/plain")
-        except Exception as e:
-            print(f"Warning: could not save fixed content to MinIO: {e}")
-
-        # Update the latest ValidationResult
-        from backend.app.models import ValidationResult
-        stmt = (
-            select(ValidationResult)
-            .where(ValidationResult.document_id == document_id)
-            .order_by(ValidationResult.created_at.desc())
-            .limit(1)
-        )
-        db_result = await db.execute(stmt)
-        v = db_result.scalar_one_or_none()
-        if v:
-            existing_report = v.report_json or {}
-            existing_report["fixed_content"] = result["transformed_content"]
-            existing_report["fixed_path"] = fixed_object_name
-            existing_report["decision_flow"] = {
-                "action": result["action"],
-                "score": result["score"],
-                "risk": result["risk"],
-                "rule_selection": result["rule_selection"],
-                "warnings": result["warnings"],
-                "deviations": result.get("deviations", []),
-                "change_summary": result.get("change_summary", ""),
-            }
-            v.report_json = existing_report
-            db.add(v)
-            await db.commit()
-
-    # 5. Audit
-    await audit_service.log_action(
-        db,
-        actor_id=current_user.get("sub", "unknown"),
-        action=f"DECISION_FLOW_{result['action'].upper()}",
-        target_id=document_id,
-        details={
-            "standard_version_id": str(effective_std_version.id),
-            "score": result["score"],
-            "risk": result["risk"],
-            "action": result["action"]
-        }
-    )
-    await db.commit()
+    # 3. Trigger background task
+    from backend.app.tasks import fix_document_task
+    fix_document_task.delay(str(document_id), competence_level)
     
     return {
-        "fixed_content": result.get("transformed_content"),
-        "original_content": result.get("original_content"),
-        "filename": document.filename,
-        "decision_flow": {
-            "action": result["action"],
-            "score": result["score"],
-            "risk": result["risk"],
-            "compatibility": result.get("compatibility"),
-            "rule_selection": result.get("rule_selection"),
-            "warnings": result.get("warnings", []),
-            "deviations": result.get("deviations", []),
-            "preserved_items": result.get("preserved_items", []),
-            "change_summary": result.get("change_summary", ""),
-        }
+        "status": "async_triggered", 
+        "message": "AI transformation task started in the background.",
+        "polling_endpoint": f"/api/v1/documents/{document_id}/validation"
     }
 
 @router.delete("/{document_id}")
@@ -354,6 +268,49 @@ async def rename_document(
     await db.commit()
     await db.refresh(document)
     return document
+
+@router.get("/{document_id}/download")
+async def download_document_file(
+    *,
+    db: AsyncSession = Depends(get_session),
+    document_id: uuid.UUID,
+    path: Optional[str] = None,
+    current_user: dict = Depends(deps.get_current_active_user),
+) -> Any:
+    """
+    Download a document file from MinIO.
+    If 'path' is provided, it fetches that specific path (e.g., fixed versions).
+    Otherwise, it fetches the original document.
+    """
+    from fastapi.responses import Response
+    
+    document = await db.get(Document, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    storage_path = path if path else (document.minio_version_id or f"{document.id}/{document.filename}")
+    
+    try:
+        file_content = minio_client.get_file(storage_path)
+        
+        # Determine content type based on path
+        content_type = "application/octet-stream"
+        if storage_path.endswith(".pdf"):
+            content_type = "application/pdf"
+        elif storage_path.endswith(".txt"):
+            content_type = "text/plain"
+            
+        filename = storage_path.split("/")[-1]
+        
+        return Response(
+            content=file_content,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"File not found or error: {str(e)}")
 
 
 

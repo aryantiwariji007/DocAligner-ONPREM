@@ -23,6 +23,7 @@ celery_app.conf.task_routes = {
     "backend.app.tasks.validate_document_task_stage2": {"queue": "stage2-slow"},
     "backend.app.tasks.revalidate_folder_task": {"queue": "stage2-slow"}, # Full sweeps can go to slow
     "backend.app.tasks.validate_document_task": {"queue": "stage2-slow"}, # Legacy fallback
+    "backend.app.tasks.fix_document_task": {"queue": "stage2-slow"},
 }
 
 celery_app.conf.task_queues = [

@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # AI (Ollama - on-premise)
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")
+    
+    # AI (Local llama.cpp)
+    LLAMA_CPP_MODEL_PATH: str = os.getenv("LLAMA_CPP_MODEL_PATH", "/app/models/qwen2.5-7b-instruct.gguf")
 
     model_config = SettingsConfigDict(
         env_file=".env",

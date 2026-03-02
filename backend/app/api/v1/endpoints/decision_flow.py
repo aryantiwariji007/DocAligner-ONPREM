@@ -92,14 +92,41 @@ async def apply_with_decision_flow(
     if result.get("transformed_content"):
         from backend.app.models import ValidationResult
         from sqlmodel import select
+        from backend.app.services.pdf_service import pdf_service
 
-        fixed_object_name = f"fixed/{document_id}/{document.filename}.fixed.txt"
+        fixed_txt_name = f"fixed/{document_id}/{document.filename}.fixed.txt"
+        fixed_pdf_name = f"fixed/{document_id}/{document.filename}.fixed.pdf"
+        
         try:
+            # Save Text version
             minio_client.upload_file(
                 result["transformed_content"].encode("utf-8"),
-                fixed_object_name,
+                fixed_txt_name,
                 "text/plain"
             )
+            
+            # Save PDF version (STATIC Structural Injection from Graph)
+            if result.get("pdf_path"):
+                try:
+                    pdf_path = result["pdf_path"]
+                    with open(pdf_path, "rb") as f:
+                        pdf_bytes = f.read()
+                        minio_client.upload_file(
+                            pdf_bytes,
+                            fixed_pdf_name,
+                            "application/pdf"
+                        )
+                    # Cleanup local temp pdf
+                    import os
+                    if os.path.exists(pdf_path):
+                        os.remove(pdf_path)
+                    result["fixed_pdf_path"] = fixed_pdf_name
+                except Exception as pdf_err:
+                    print(f"Warning: PDF upload failed: {pdf_err}")
+                    result["pdf_error"] = str(pdf_err)
+            else:
+                 print("Warning: No pdf_path returned from DecisionFlow graph")
+
         except Exception as e:
             print(f"Warning: could not save fixed content: {e}")
 
@@ -115,13 +142,14 @@ async def apply_with_decision_flow(
         if v:
             existing = v.report_json or {}
             existing["fixed_content"] = result["transformed_content"]
-            existing["fixed_path"] = fixed_object_name
+            existing["fixed_path"] = fixed_txt_name
+            existing["fixed_pdf_path"] = fixed_pdf_name if "fixed_pdf_path" in result else None
             existing["decision_flow"] = {
                 "action": result["action"],
                 "score": result["score"],
                 "risk": result["risk"],
-                "rule_selection": result["rule_selection"],
-                "warnings": result["warnings"],
+                "rule_selection": result.get("rule_selection", {}),
+                "warnings": result.get("warnings", []),
             }
             v.report_json = existing
             db.add(v)

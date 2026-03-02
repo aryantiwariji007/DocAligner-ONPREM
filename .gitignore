@@ -1,0 +1,68 @@
+# Python
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environment
+.env
+.env*
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Project specific
+docker/logs.txt
+memory.db
+*.db
+/tmp/
+/pdf_outputs/
+backend/app/templates/*.pdf
+backend/app/templates/*.aux
+backend/app/templates/*.log
+backend/app/templates/*.tex
+!backend/app/templates/compliance_report.tex
+
+# Test files (as requested by user)
+**/test_*.py
+**/conftest.py
+tests/
+
+# Debug files
+*.log
+debug.txt
+check_latest.py
+
+# Docker
+.dockerignore
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -34,11 +34,11 @@ class AIService:
             "options": {
                 "temperature": 0.0,
                 "top_p": 0.9,
-                "num_ctx": 65536,
+                "num_ctx": 32700,
             }
         }
         
-        async with httpx.AsyncClient(timeout=1200.0) as client:
+        async with httpx.AsyncClient(timeout=480.0) as client:
             try:
                 response = await client.post(f"{self.base_url}/api/chat", json=payload)
                 response.raise_for_status()
@@ -77,7 +77,7 @@ class AIService:
 
         Document Filename: {filename}
         Document Content:
-        {text[:200000]}
+        {text[:60000]}
         """
         
         # We define a flat list of sections rather than deeply recursive to ensure stable JSON output from Ollama,
@@ -192,16 +192,26 @@ class AIService:
         Return the full document content reconstructed structurally.
         
         TARGET DOC:
-        {doc_text[:200000]}
+        {doc_text[:60000]}
         """
         
         schema = {
             "type": "object",
             "properties": {
                 "transformed_text": {"type": "string"},
-                "change_summary": {"type": "string"}
+                "change_summary": {"type": "string"},
+                "structural_json": {
+                    "type": "object",
+                    "properties": {
+                        "TITLE": {"type": "string"},
+                        "ABSTRACT": {"type": "string"},
+                        "CONTEXT": {"type": "string"},
+                        "CONTENT": {"type": "string"}
+                    },
+                    "required": ["TITLE", "ABSTRACT", "CONTEXT", "CONTENT"]
+                }
             },
-            "required": ["transformed_text", "change_summary"]
+            "required": ["transformed_text", "change_summary", "structural_json"]
         }
 
         try:

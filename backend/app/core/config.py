@@ -27,12 +27,15 @@ class Settings(BaseSettings):
     # REDIS
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     
+    # AI Selection
+    USE_LOCAL_AI: bool = False
+    
     # AI (Ollama - on-premise)
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen3-vl:latest")
     
     # AI (Local llama.cpp)
-    LLAMA_CPP_MODEL_PATH: str = os.getenv("LLAMA_CPP_MODEL_PATH", "/app/models/qwen2.5-7b-instruct.gguf")
+    LLAMA_CPP_MODEL_PATH: str = os.getenv("LLAMA_CPP_MODEL_PATH", "/app/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf")
 
     model_config = SettingsConfigDict(
         env_file=".env",

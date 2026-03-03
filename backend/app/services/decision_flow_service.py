@@ -41,19 +41,27 @@ class DecisionState(TypedDict):
     
     stop_at_scoring: bool | None
     
+    images: List[str] | None
+    
     error: str | None
 
 async def extract_structure(state: DecisionState) -> Dict[str, Any]:
-    """Node 1: Extract candidate structure using LLM."""
+    """Node 1: Extract candidate structure using LLM (Vision-augmented)."""
     print("DEBUG: [DecisionFlow] Node 1: extract_structure")
-    text = rule_extraction_factory.extract_text(state["file_content"], state["filename"])
+    extraction_res = rule_extraction_factory.extract_text(state["file_content"], state["filename"], as_multimodal=True)
+    
+    if isinstance(extraction_res, tuple):
+        text, images = extraction_res
+    else:
+        text, images = extraction_res, []
+        
     if not text:
         return {"error": "Could not extract text from document"}
         
-    # Standard AI extraction to get a rough idea (ignoring constraints just for the proposal)
-    target_raw = await ai_service.extract_target_structure(text, state["filename"])
-    if "error" in target_raw:
-        return {"error": target_raw["error"]}
+    # Standard AI extraction to get a rough idea (passing images for better structural understanding)
+    target_raw = await ai_service.extract_target_structure(text, state["filename"], images=images)
+    if not target_raw or "error" in target_raw:
+        return {"error": target_raw.get("error", "AI Extraction failed")}
         
     # Map raw strings back into our VOCAB as a simple list for the MVP proposal
     candidate = [STRUCTURE_VOCAB["DOC"]]
@@ -70,17 +78,21 @@ async def extract_structure(state: DecisionState) -> Dict[str, Any]:
         else: candidate.append(STRUCTURE_VOCAB["SECTION"])
     candidate.append(STRUCTURE_VOCAB["END"])
     
-    return {"text": text, "candidate_structure": candidate}
+    return {"text": text, "images": images, "candidate_structure": candidate}
 
 
-async def static_constrained_decoder(state: DecisionState) -> Dict[str, Any]:
+async def validate_and_score(state: DecisionState) -> Dict[str, Any]:
     """
-    Node 2: Enforce valid structures via the CSR mask mathematically.
-    Temporary Ollama Fallback: Snaps the candidate structure to the nearest valid CSR path.
+    Node 2: Deterministic Validation & Scoring.
+    1. Enforce valid structures via the CSR mask mathematically (Ollama Snapping).
+    2. Compute final deterministic compliance score.
     """
-    print("DEBUG: [DecisionFlow] Node 2: static_constrained_decoder (Ollama Snapping)")
+    print("DEBUG: [DecisionFlow] Node 2: validate_and_score")
     
-    # 1. Prepare Standard Index
+    if state.get("error"):
+        return {"final_score": 0.0, "action": "fail", "risk": "CRITICAL"}
+    
+    # --- 1. CSR Validation (Snapping) ---
     std_hash = str(hash(str(state["standard_json"])))
     if std_hash not in _active_indices:
         idx = StandardStructureIndex()
@@ -88,42 +100,18 @@ async def static_constrained_decoder(state: DecisionState) -> Dict[str, Any]:
         _active_indices[std_hash] = idx
     static_index = _active_indices[std_hash]
 
-    # 2. Algorithmic Snapping (Deterministic Path Alignment)
-    # Since we aren't masking logits with llama-cpp right now, we post-process the candidate.
-    # We walk the candidate and force every transition to be valid according to the CSR.
-    
     candidate = state.get("candidate_structure") or [STRUCTURE_VOCAB["DOC"], STRUCTURE_VOCAB["END"]]
     validated, valid_transitions = static_index.snap_to_valid_path(candidate)
 
     # Calculate deterministic metrics
-    # SVS: Percentage of transitions that were valid WITHOUT snapping
     total_steps = len(candidate) - 1
     svs = valid_transitions / max(total_steps, 1)
-    
-    # BCS/ESS: Estimated since we don't have raw logits from Ollama
-    # High SVS implies high confidence in the candidate layout.
     bcs = 0.7 + (svs * 0.25)
     ess = 0.8 + (svs * 0.15)
     
-    return {
-        "validated_structure": validated,
-        "score_svs": svs,
-        "score_bcs": bcs,
-        "score_ess": ess
-    }
-
-async def structure_scorer(state: DecisionState) -> Dict[str, Any]:
-    """Node 3: Compute final deterministic compliance score."""
-    print("DEBUG: [DecisionFlow] Node 3: structure_scorer")
-    
-    svs = state.get("score_svs", 0.0)
-    bcs = state.get("score_bcs", 0.0)
-    ess = state.get("score_ess", 0.0)
-    
-    # FinalComplianceScore = 0.5 * SVS + 0.3 * BCS + 0.2 * ESS
+    # --- 2. Final Scoring ---
     final_score = (0.5 * svs) + (0.3 * bcs) + (0.2 * ess)
     
-    # Threshold Routing
     if final_score >= 0.8:
         action = "safe_apply"
         risk = "LOW"
@@ -135,6 +123,10 @@ async def structure_scorer(state: DecisionState) -> Dict[str, Any]:
         risk = "CRITICAL"
 
     return {
+        "validated_structure": validated,
+        "score_svs": svs,
+        "score_bcs": bcs,
+        "score_ess": ess,
         "final_score": final_score,
         "action": action,
         "alignment_report": {
@@ -149,24 +141,46 @@ async def text_realizer(state: DecisionState) -> Dict[str, Any]:
     """Node 4: Map content into validated structure."""
     print("DEBUG: [DecisionFlow] Node 4: text_realizer")
     
-    # We use AI to map the original text into the rigorously mathematically validated structure tokens!
-    # [BYPASS] Irrespective of score, we allow regeneration as requested.
+    if state.get("error"):
+        return {"transformed_content": state.get("text", ""), "structural_json": {}}
 
-    # Format the strict validated structure path as text to feed the realizer prompt
-    valid_path_names = [REVERSE_VOCAB[t] for t in state["validated_structure"]]
-    target_structure_str = " -> ".join(valid_path_names)
+    # We use AI to map the original text into the rigorously mathematically validated structure tokens!
+    valid_path = state.get("validated_structure") or []
+    candidate_path = state.get("candidate_structure") or []
     
-    # Simple realizer via ai_service
+    # 1. Calculate specific missing/misplaced sections for precise fixing
+    # We map tokens to their names for better AI understanding
+    valid_names = [REVERSE_VOCAB.get(t, "SECTION") for t in valid_path if t not in [STRUCTURE_VOCAB["DOC"], STRUCTURE_VOCAB["END"]]]
+    candidate_names = [REVERSE_VOCAB.get(t, "SECTION") for t in candidate_path if t not in [STRUCTURE_VOCAB["DOC"], STRUCTURE_VOCAB["END"]]]
+    
+    missing_sections = [name for name in valid_names if name not in candidate_names]
+    
+    # Misplaced logic: Sections that are present but in the wrong order
+    misplaced = []
+    # Simple check: if the sequence of common elements differs
+    common_in_candidate = [name for name in candidate_names if name in valid_names]
+    common_in_valid = [name for name in valid_names if name in candidate_names]
+    
+    if common_in_candidate != common_in_valid:
+        for i, name in enumerate(common_in_candidate):
+            if i < len(common_in_valid) and name != common_in_valid[i]:
+                misplaced.append({"section": name, "should_be_near": common_in_valid[i]})
+
+    target_structure_str = " -> ".join(valid_names)
+    
+    # 2. Call ai_service with full context and vision evidence
     transformed = await ai_service.transform_document(
         state["text"], 
-        {"validated_path": target_structure_str},
-        missing_sections=[], 
-        misplaced_sections=[]
+        {"expected_hierarchy": target_structure_str},
+        missing_sections=missing_sections, 
+        misplaced_sections=misplaced,
+        images=state.get("images", []) # Passing the vision evidence!
     )
     
     return {
         "transformed_content": transformed.get("transformed_text", state["text"]),
-        "structural_json": transformed.get("structural_json", {})
+        "structural_json": transformed.get("structural_json", {}),
+        "change_summary": transformed.get("change_summary", "Reconstructing document to align with standard structure.")
     }
 
 async def fixed_pdf_generator_node(state: DecisionState) -> Dict[str, Any]:
@@ -195,21 +209,20 @@ def _build_graph() -> StateGraph:
     workflow = StateGraph(DecisionState)
     
     workflow.add_node("extract_structure", extract_structure)
-    workflow.add_node("static_constrained_decoder", static_constrained_decoder)
-    workflow.add_node("structure_scorer", structure_scorer)
+    workflow.add_node("validate_and_score", validate_and_score)
     workflow.add_node("text_realizer", text_realizer)
     workflow.add_node("fixed_pdf_generator", fixed_pdf_generator_node)
     
     workflow.add_edge(START, "extract_structure")
-    workflow.add_edge("extract_structure", "static_constrained_decoder")
-    workflow.add_edge("static_constrained_decoder", "structure_scorer")
+    workflow.add_edge("extract_structure", "validate_and_score")
+    
     def router(state: DecisionState) -> Literal["text_realizer", "__end__"]:
-        if state.get("stop_at_scoring"):
+        if state.get("stop_at_scoring") or state.get("error"):
             return "__end__"
         return "text_realizer"
 
     workflow.add_conditional_edges(
-        "structure_scorer",
+        "validate_and_score",
         router,
         {
             "text_realizer": "text_realizer",
@@ -248,6 +261,7 @@ class DecisionFlowService:
             "template_id": "compliance_report_v1",
             "pdf_path": None,
             "stop_at_scoring": stop_at_scoring,
+            "images": None,
             "error": None
         }
         
@@ -270,6 +284,7 @@ class DecisionFlowService:
             "filename": filename,
             "change_summary": report.get("change_summary", "Enforced STATIC template structure."),
             "alignment_details": report,
+            "vision_evidence": final_state.get("images", [])[:3], # Provide first 3 pages as vision evidence
             "compatibility": {
                 "total_score": final_score,
                 "risk_classification": report.get("risk", "high"),

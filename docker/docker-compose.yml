@@ -16,9 +16,14 @@ services:
       - MINIO_ENDPOINT=minio:9000
       - WATCHFILES_FORCE_POLLING=true
       - PYTHONPATH=/app
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=qwen2.5:3b
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen3-vl:latest
       - QDRANT_URL=http://qdrant:6333
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8001:8000"
     restart: always
@@ -43,9 +48,14 @@ services:
       - MINIO_ENDPOINT=minio:9000
       - WATCHFILES_FORCE_POLLING=true
       - PYTHONPATH=/app
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=qwen2.5:3b
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=qwen3-vl:latest
       - QDRANT_URL=http://qdrant:6333
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: always
     depends_on:
       - db
@@ -103,7 +113,23 @@ services:
       - qdrant_data:/qdrant/storage
     restart: always
 
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    restart: always
+
 volumes:
   postgres_data:
   minio_data:
   qdrant_data:
+  ollama_data:

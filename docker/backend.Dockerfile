@@ -24,8 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --default-timeout=100 -r requirements.txt
 
-# Create a non-root user
-RUN groupadd -r docaligner && useradd -r -g docaligner docaligner
+# Create a non-root user with a home directory
+RUN groupadd -r docaligner && useradd -m -g docaligner docaligner
 RUN chown -R docaligner:docaligner /app
 USER docaligner
 

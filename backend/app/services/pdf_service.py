@@ -67,8 +67,14 @@ def generate_fixed_pdf(template_id: str, content_json_str: str) -> str:
 
     try:
         # 1. Setup paths
-        output_dir = Path("/tmp/pdf_outputs").absolute()
+        # Inside Docker, /app/backend is owned by docaligner
+        output_dir = Path("/app/backend/runtime_pdfs").absolute()
         output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Setup Tectonic cache in a writable location
+        cache_dir = Path("/app/backend/.tectonic_cache").absolute()
+        cache_dir.mkdir(exist_ok=True, parents=True)
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_filename = f"{template_id}_{timestamp}"
 
@@ -89,12 +95,43 @@ def generate_fixed_pdf(template_id: str, content_json_str: str) -> str:
         final_latex = latex_template
         for key, value in content.items():
             placeholder = f"<<{key.upper()}>>"
-            # Simple LaTeX escaping for common problematic chars
-            safe_value = str(value).replace("_", "\\_").replace("#", "\\#").replace("%", "\\%").replace("$", "\\$")
+            # More robust LaTeX escaping
+            safe_value = str(value).replace("\\", "\\textbackslash{}") \
+                                   .replace("_", "\\_") \
+                                   .replace("#", "\\#") \
+                                   .replace("%", "\\%") \
+                                   .replace("$", "\\$") \
+                                   .replace("&", "\\&") \
+                                   .replace("{", "\\{") \
+                                   .replace("}", "\\}") \
+                                   .replace("~", "\\textasciitilde{}") \
+                                   .replace("^", "\\textasciicircum{}")
             final_latex = final_latex.replace(placeholder, safe_value)
 
         # 4. Render
-        return _render_latex_pdf(final_latex, output_dir, base_filename)
+        # Write to file first
+        tex_file = output_dir / f"{base_filename}.tex"
+        tex_file.write_text(final_latex)
+        
+        # Pass TECTONIC_CACHE_DIR to environment
+        env = os.environ.copy()
+        env["TECTONIC_CACHE_DIR"] = str(cache_dir)
+        
+        # Run Tectonic
+        result = subprocess.run(
+            ["tectonic", f"{base_filename}.tex", "--outdir", str(output_dir)],
+            cwd=output_dir,
+            capture_output=True,
+            text=True,
+            env=env
+        )
+        
+        if result.returncode != 0:
+            print(f"Tectonic Error Output: {result.stderr}")
+            raise RuntimeError(f"Tectonic failed with return code {result.returncode}")
+
+        final_pdf = output_dir / f"{base_filename}.pdf"
+        return str(final_pdf)
 
     except Exception as e:
         print(f"Error in generate_fixed_pdf: {str(e)}")

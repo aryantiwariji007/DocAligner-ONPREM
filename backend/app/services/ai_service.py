@@ -17,9 +17,9 @@ class AIService:
         except Exception:
             return False
 
-    async def _chat(self, prompt: str, schema_dict: Dict[str, Any], temperature: float = 0.0) -> Dict[str, Any]:
-        """Helper to call Ollama chat with a JSON schema constraint."""
-        print(f"DEBUG: [AIService] Calling LLM model {self.model_name}...")
+    async def _chat(self, prompt: str, schema_dict: Dict[str, Any], images: List[str] = None, temperature: float = 0.0) -> Dict[str, Any]:
+        """Helper to call Ollama chat with a JSON schema constraint and optional images."""
+        print(f"DEBUG: [AIService] Calling LLM model {self.model_name} with {len(images) if images else 0} images...")
         payload = {
             "model": self.model_name,
             "messages": [
@@ -34,37 +34,44 @@ class AIService:
             "options": {
                 "temperature": 0.0,
                 "top_p": 0.9,
-                "num_ctx": 32700,
+                "num_ctx": 16000,
             }
         }
         
-        async with httpx.AsyncClient(timeout=480.0) as client:
+        if images:
+            payload["messages"][1]["images"] = images
+        
+        async with httpx.AsyncClient(timeout=1200.0) as client:
             try:
                 response = await client.post(f"{self.base_url}/api/chat", json=payload)
                 response.raise_for_status()
                 data = response.json()
                 content = data.get("message", {}).get("content", "")
                 return json.loads(content)
+            except httpx.ReadTimeout as e:
+                 print(f"[AIService] ReadTimeout: The AI model took too long to respond ({self.model_name})")
+                 return {"error": "AI response timed out. Try with a smaller document or higher performance hardware."}
             except httpx.HTTPStatusError as e:
                 print(f"[AIService] HTTP Error: {e.response.status_code} - {e.response.text}")
                 raise e
             except json.JSONDecodeError as e:
                 print(f"[AIService] JSON Parse Error. Content was: {content}")
-                raise e
+                return {"error": "Invalid AI response structure", "p_content": content[:200]}
             except Exception as e:
-                print(f"[AIService] Chat error: {e}")
-                raise e
+                print(f"[AIService] Chat error ({type(e).__name__}): {e}")
+                return {"error": f"AI process failed: {str(e)}"}
 
-    async def extract_standard(self, text: str, filename: str) -> Dict[str, Any]:
+    async def extract_standard(self, text: str, filename: str, images: List[str] = None) -> Dict[str, Any]:
         """
         Extracts ONLY the document structure, hierarchy, and formatting patterns.
-        Do NOT infer rules, policies, constraints, or compliance logic.
+        Can process with vision (images) if provided.
         """
         if not await self.is_available():
             return {"error": "AI Service not configured"}
 
         prompt = f"""
         Analyze the document and extract the structural template. 
+        {"Review the provided images to better understand layout, tables, and headers." if images else ""}
         
         Tasks:
         1. Identify Section titles and numbering logic
@@ -77,7 +84,7 @@ class AIService:
 
         Document Filename: {filename}
         Document Content:
-        {text[:60000]}
+        {text[:50000]}
         """
         
         # We define a flat list of sections rather than deeply recursive to ensure stable JSON output from Ollama,
@@ -107,17 +114,17 @@ class AIService:
         }
 
         try:
-            return await self._chat(prompt, schema)
+            return await self._chat(prompt, schema, images=images)
         except Exception as e:
             return {"error": f"AI extraction failed: {str(e)}"}
 
-    async def extract_target_structure(self, text: str, filename: str) -> Dict[str, Any]:
+    async def extract_target_structure(self, text: str, filename: str, images: List[str] = None) -> Dict[str, Any]:
         """
         Node 1: Structure Extractor.
         Parses the Target Document to identify its current structure.
         """
         # We reuse the exact same schema and prompt logic as extraction, applied to target
-        return await self.extract_standard(text, filename)
+        return await self.extract_standard(text, filename, images=images)
 
     async def normalize_structure(self, target_structure: Dict[str, Any], template: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -175,7 +182,7 @@ class AIService:
         except Exception as e:
             return {"error": f"AI normalization failed: {str(e)}"}
 
-    async def transform_document(self, doc_text: str, target_structure: Dict[str, Any], missing_sections: List[str], misplaced_sections: List[Dict[str, Any]]) -> Dict[str, Any]:
+    async def transform_document(self, doc_text: str, target_structure: Dict[str, Any], missing_sections: List[str], misplaced_sections: List[Dict[str, Any]], images: List[str] = None) -> Dict[str, Any]:
         """
         Node 5/Auto-Fix: Transforms document to match the exact template structure.
         """
@@ -185,13 +192,20 @@ class AIService:
         prompt = f"""
         You are a Document-Structure Auto-Fix Engine.
         Your job is to rewrite the target document ONLY to correct structural alignment errors.
-        - Add missing mandatory sections: {missing_sections} (Insert "[TO BE ADDED]" as placeholder text)
+        {"Review the provided images of the original document as a layout reference to ensure correct reconstruction." if images else ""}
+        
+        Fix Instructions:
+        - Add missing mandatory sections: {missing_sections} (Insert "[TO BE ADDED]" as placeholder text if content is unknown)
         - Move misplaced sections to their correct order: {json.dumps(misplaced_sections)}
+        - Target Structure Reference: {json.dumps(target_structure)}
         
-        CRITICAL: Do NOT infer rules, changing meanings, or altering wording. Only shift structure.
-        Return the full document content reconstructed structurally.
+        CRITICAL CONSTRAINTS:
+        - Do NOT infer rules or change the meaning of the content.
+        - Do NOT alter the wording beyond moving sections or adding placeholders.
+        - Only shift structure to match the required standard.
+        - Return the full document content reconstructed structurally.
         
-        TARGET DOC:
+        TARGET DOC CONTENT:
         {doc_text[:60000]}
         """
         
@@ -215,7 +229,7 @@ class AIService:
         }
 
         try:
-            return await self._chat(prompt, schema)
+            return await self._chat(prompt, schema, images=images)
         except Exception as e:
             return {"error": f"AI transformation failed: {str(e)}"}
 

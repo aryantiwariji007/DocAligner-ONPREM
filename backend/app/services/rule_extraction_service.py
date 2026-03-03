@@ -104,13 +104,17 @@ class RuleExtractionFactory:
         return extractor.extract_rules(file_content, filename)
 
     @staticmethod
-    def extract_text(file_content: bytes, filename: str, with_images: bool = False) -> str:
-        """Extracts plain text with embedded images (as base64) from file content."""
+    def extract_text(file_content: bytes, filename: str, with_images: bool = False, as_multimodal: bool = False) -> Any:
+        """
+        Extracts plain text with optional multimodal images.
+        If as_multimodal is True, returns (text, [b64_images])
+        """
         import io
         import base64
         
         ext = filename.lower().split('.')[-1] if '.' in filename else ""
         text = ""
+        images = []
         
         try:
             if ext == 'pdf':
@@ -121,22 +125,25 @@ class RuleExtractionFactory:
                      page = doc[page_index]
                      p_text = page.get_text()
                      
+                     # Extract page as an image for multimodal vision
+                     if as_multimodal and page_index < 3: # Limit to first 3 pages
+                         pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2)) # Slightly lower res for faster processing
+                         img_bytes = pix.tobytes("png")
+                         b64 = base64.b64encode(img_bytes).decode("utf-8")
+                         images.append(b64)
+                     
                      if with_images:
-                         # Extract images for this page
+                         # Inline images (legacy)
                          image_list = page.get_images(full=True)
                          for img_index, img in enumerate(image_list):
                              xref = img[0]
                              base_image = doc.extract_image(xref)
                              image_bytes = base_image["image"]
                              image_ext = base_image["ext"]
-                             # Data URIs can be huge, let's only take small/medium ones to avoid token bloat
-                             # Technical diagrams are often < 50kb
-                             if len(image_bytes) < 500000: # 500KB limit per image for AI context
+                             if len(image_bytes) < 500000:
                                  b64 = base64.b64encode(image_bytes).decode("utf-8")
                                  data_uri = f"data:image/{image_ext};base64,{b64}"
                                  p_text += f"\n\n![Original Image {page_index+1}-{img_index+1}]({data_uri})\n\n"
-                             else:
-                                 p_text += f"\n\n![Large Image Placeholder: {image_ext}]\n\n"
                      
                      pages_text.append(p_text)
                  text = "\n---\n".join(pages_text)
@@ -145,20 +152,20 @@ class RuleExtractionFactory:
                  try:
                      import mammoth
                      import markdownify
-                     # mammoth handles image conversion to base64 by default in its HTML output
                      result = mammoth.convert_to_html(io.BytesIO(file_content))
                      html = result.value
                      text = markdownify.markdownify(html)
                  except ImportError:
                      text = file_content.decode('utf-8', errors='ignore')
-            elif ext in ['txt', 'md', 'json', 'xml', 'html', 'css', 'js', 'py', 'java', 'c', 'cpp']:
-                 text = file_content.decode('utf-8', errors='ignore')
             else:
-                 # Fallback for binary or unknown
                  text = file_content.decode('utf-8', errors='ignore')
-                 
+            
+            if as_multimodal:
+                return text, images
             return text
         except Exception as e:
-            return f"Error extracting text: {str(e)}"
+            err = f"Error extracting text: {str(e)}"
+            if as_multimodal: return err, []
+            return err
 
 rule_extraction_factory = RuleExtractionFactory()
